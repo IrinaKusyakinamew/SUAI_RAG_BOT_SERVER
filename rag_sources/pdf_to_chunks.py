@@ -20,8 +20,6 @@ import hashlib
 import multiprocessing
 from datetime import datetime
 import shutil
-
-
 from pathlib import Path
 
 # Текущая директория, где лежит скрипт (rag_sources)
@@ -31,13 +29,19 @@ PROJECT_DIR = Path(__file__).resolve().parent
 INPUT_CSV = PROJECT_DIR.parent / "parser" / "out_spider" / "spiders" / "links.csv"
 
 # Директория, куда сохраняются временные и итоговые данные
-BASE_DIR = PROJECT_DIR  # то есть rag_sources
+BASE_DIR = PROJECT_DIR  # rag_sources
+
+# Папка для временных чанков
+TMP_DIR = PROJECT_DIR / "tmp_chunks"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Временные папки и файлы
 DOWNLOAD_DIR = BASE_DIR / "saved_pdf"
 PDF_DIR = DOWNLOAD_DIR / "pdf"
 MAP_PATH = DOWNLOAD_DIR / "pdf_url_map.json"
-OUTPUT_JSON = BASE_DIR / "chunks_all_pdf.json"
+
+# Итоговый файл чанков для PDF, будет использоваться в making_json_of_chunks
+OUTPUT_JSON = TMP_DIR / "chunks_pdf.json"
 
 # Параметры чанкинга и загрузки
 CHUNK_SIZE = 512

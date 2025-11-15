@@ -14,15 +14,23 @@ warnings.filterwarnings("ignore")
 
 # Настройки путей
 BASE_DIR = Path(__file__).parent.parent
+
+# Папка с html-страницами
 HTML_DIR = BASE_DIR / "rag_sources" / "saved_html_pages"
-OUTPUT_JSON = BASE_DIR / "rag_sources" / "chunks_all_html.json"
+
+# Папка для временных чанков
+TMP_DIR = BASE_DIR / "rag_sources" / "tmp_chunks"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Файл, куда будет сохраняться результат
+OUTPUT_JSON = TMP_DIR / "chunks_html.json"
 
 MAX_TOKENS = 512
 ATTR_CUTOFF_LEN = 50
 CLEAN_HTML = True
 MIN_WORDS = 5
 
-os.makedirs(HTML_DIR, exist_ok=True)
+HTML_DIR.mkdir(parents=True, exist_ok=True)
 
 # Функция очистки html
 def clean_html_text(html_content: str) -> str:
@@ -132,6 +140,11 @@ def main():
 
     print(f"\nГотово! Всего чанков: {len(all_chunks)}")
 
+    # Удаляем папку с исходными HTML после обработки
+    if HTML_DIR.exists():
+        import shutil
+        shutil.rmtree(HTML_DIR)
+        print(f"Папка {HTML_DIR} удалена после создания JSON")
 
 if __name__ == "__main__":
     main()

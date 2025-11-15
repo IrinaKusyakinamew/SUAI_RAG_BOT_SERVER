@@ -6,11 +6,16 @@ from tqdm import tqdm
 
 # Корень проекта
 BASE_DIR = Path(__file__).parent.parent
+
+# Папка для временных файлов-чанков
+TMP_DIR = BASE_DIR / "rag_sources" / "tmp_chunks"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
 # Исходный json с docx доками
 INPUT_JSON = BASE_DIR / "parser" / "out_spider" / "spiders" / "parsed_docx.json"
-# Файл, куда сохраняем итоговые чанки
-OUTPUT_JSON = BASE_DIR / "rag_sources" / "chunks_all_docx.json"
 
+# Куда сохраняем чанки
+OUTPUT_JSON = TMP_DIR / "chunks_docx.json"
 
 # Создаем папку для результата, если ее еще нет
 OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
