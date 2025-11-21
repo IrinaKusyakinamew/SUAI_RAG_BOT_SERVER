@@ -11,7 +11,7 @@ BOT_NAME = "out_spider"
 
 SPIDER_MODULES = ["out_spider.spiders"]
 NEWSPIDER_MODULE = "out_spider.spiders"
-DEPTH_LIMIT = 4
+DEPTH_LIMIT = 2
 
 ROBOTSTXT_OBEY = False
 
@@ -95,3 +95,12 @@ FILES_STORE = 'downloaded_files'  # Путь, где будут хранитьс
 
 # Set settings whose default value is deprecated to a future-proof value
 FEED_EXPORT_ENCODING = "utf-8"
+
+
+MINIO_CONFIG = {
+    'endpoint': '212.192.220.24:9000',
+    'access_key': 'ie4e4EYG2tW2VyFlRKyy',
+    'secret_key': 'zML3Q8A1nFtsPnfZzfGFsmJqbrAosLLASUwyIOZ9',
+    'secure': False,
+    'bucket_name': 'web-crawler'
+}

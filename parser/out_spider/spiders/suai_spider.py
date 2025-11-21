@@ -5,20 +5,17 @@ import os
 import hashlib
 from scrapy.pipelines.files import FilesPipeline
 import requests
-
+from minio import Minio
+import io
 
 class LinkParserSpider(scrapy.Spider):
     name = 'link_parser'
     start_urls = []
     output_file = "out_spider/spiders/links.csv"
-    html_folder = "saved_html_pages"
-    files_folder = "downloaded_files"
 
     visited = set()
     file_links = set()
-
-    file_extensions = [".pdf", ".docx"]  # Массив для фильтрации файлов по расширениям
-    allowed_extensions = [".pdf", ".docx", ".html"]
+    file_extensions = [".pdf", ".docx"]
 
     def __init__(self, start_urls=None, output_file=None, *args, **kwargs):
         super(LinkParserSpider, self).__init__(*args, **kwargs)
@@ -27,8 +24,34 @@ class LinkParserSpider(scrapy.Spider):
         if output_file:
             self.output_file = output_file
 
-        os.makedirs(self.html_folder, exist_ok=True)
-        os.makedirs(self.files_folder, exist_ok=True)
+        # Берем настройки из settings.py
+        from scrapy.utils.project import get_project_settings
+        settings = get_project_settings()
+        self.minio_config = settings.get('MINIO_CONFIG', {})
+
+        # Инициализация MinIO клиента
+        self.minio_client = Minio(
+            self.minio_config['endpoint'],
+            access_key=self.minio_config['access_key'],
+            secret_key=self.minio_config['secret_key'],
+            secure=self.minio_config['secure']
+        )
+        self.bucket_name = self.minio_config['bucket_name']
+
+        # Накопление ссылок в памяти
+        self.links_buffer = []
+
+        # Создаем бакет если не существует
+        self.setup_minio_bucket()
+
+    def setup_minio_bucket(self):
+        """Создает бакет в MinIO если не существует"""
+        try:
+            if not self.minio_client.bucket_exists(self.bucket_name):
+                self.minio_client.make_bucket(self.bucket_name)
+                self.logger.info(f"Создан бакет в MinIO: {self.bucket_name}")
+        except Exception as e:
+            self.logger.error(f"Ошибка создания бакета в MinIO: {e}")
 
     def parse(self, response):
         self.save_html_page(response.url, response.body)
@@ -59,9 +82,6 @@ class LinkParserSpider(scrapy.Spider):
                         self.file_links.add(full_url)
                         self.save_link(full_url, file_type)
 
-                        # # Пробуем скачать файл
-                        # self.download_file(full_url, file_type)
-
                     elif full_url.lower().endswith('.html') or urlparse(full_url).netloc == urlparse(
                             self.start_urls[0]).netloc:
                         # Внутренние страницы продолжаем обходить
@@ -75,27 +95,72 @@ class LinkParserSpider(scrapy.Spider):
                     self.logger.error(f"Ошибка при обработке ссылки {link}: {e}")
 
     def save_html_page(self, url, html_content):
+        """Сохраняет HTML страницу в MinIO"""
         try:
             file_name = hashlib.md5(url.encode('utf-8')).hexdigest() + ".html"
-            file_path = os.path.join(self.html_folder, file_name)
+            object_name = f"html_pages/{file_name}"
 
-            with open(file_path, 'wb') as f:
-                f.write(html_content)
+            # Конвертируем в bytes если нужно
+            if isinstance(html_content, str):
+                html_content = html_content.encode('utf-8')
 
-            self.logger.info(f"Сохранена HTML-страница: {file_path}")
+            # Сохраняем в MinIO
+            self.minio_client.put_object(
+                self.bucket_name,
+                object_name,
+                io.BytesIO(html_content),
+                length=len(html_content),
+                content_type="text/html"
+            )
+
+            self.logger.info(f"Сохранена HTML-страница в MinIO: {object_name}")
         except Exception as e:
-            self.logger.error(f"Ошибка сохранения HTML: {e}")
+            self.logger.error(f"Ошибка сохранения HTML в MinIO: {e}")
 
     def save_link(self, url, link_type):
-        """Сохраняем ссылку в CSV"""
+        """Сохраняем ссылку в буфер (в памяти)"""
+        self.links_buffer.append([url, link_type])
+
+        # Сбрасываем в MinIO каждые 10 ссылок
+        if len(self.links_buffer) >= 10:
+            self.flush_links_to_minio()
+
+        self.logger.info(f"Ссылка добавлена в буфер ({link_type}): {url}")
+
+    def flush_links_to_minio(self):
+        """Сбрасывает накопленные ссылки в MinIO"""
+        if not self.links_buffer:
+            return
+
         try:
-            with open(self.output_file, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            # Создаем CSV в памяти
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            # Заголовок
+            writer.writerow(['url', 'type'])
+
+            # Данные
+            for url, link_type in self.links_buffer:
                 writer.writerow([url, link_type])
 
-            self.logger.info(f"Сохранена ссылка ({link_type}): {url}")
+            # Конвертируем в bytes
+            csv_data = output.getvalue().encode('utf-8')
+
+            # Сохраняем в MinIO (перезаписываем весь файл)
+            self.minio_client.put_object(
+                self.bucket_name,
+                "results/links.csv",
+                io.BytesIO(csv_data),
+                length=len(csv_data),
+                content_type="text/csv"
+            )
+
+            self.logger.info(f"Сброшено {len(self.links_buffer)} ссылок в MinIO")
+            self.links_buffer = []  # Очищаем буфер
+
         except Exception as e:
-            self.logger.error(f"Ошибка сохранения ссылки: {e}")
+            self.logger.error(f"Ошибка сохранения ссылок в MinIO: {e}")
 
     def handle_error(self, failure):
         """Обработка ошибок запроса"""
