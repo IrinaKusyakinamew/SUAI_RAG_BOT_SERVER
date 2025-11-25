@@ -41,6 +41,7 @@ class BaseAgent(AgentRegistryMixin):
         agent_config: AgentConfig,
         toolkit: list[Type[BaseTool]],
         def_name: str | None = None,
+        conversation_history: list[dict] | None = None,
         **kwargs: dict,
     ):
         self.id = f"{def_name or self.name}_{uuid.uuid4()}"
@@ -51,10 +52,17 @@ class BaseAgent(AgentRegistryMixin):
         self.toolkit = toolkit
 
         self._context = ResearchContext()
-        self.conversation = []
+
+        # Initialize conversation with history if provided
+        if conversation_history:
+            self.conversation = list(conversation_history)
+            self.logger = get_logger(f"Agent:{self.id}")
+            self.logger.info(f"Initialized agent with {len(conversation_history)} history messages")
+        else:
+            self.conversation = []
+            self.logger = get_logger(f"Agent:{self.id}")
 
         self.streaming_generator = OpenAIStreamingGenerator(model=self.id)
-        self.logger = get_logger(f"Agent:{self.id}")
         self.log = []
 
     async def provide_clarification(self, clarifications: str):

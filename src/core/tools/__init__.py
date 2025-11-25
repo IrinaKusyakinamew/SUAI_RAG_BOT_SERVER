@@ -11,6 +11,7 @@ from core.tools.final_answer_tool import FinalAnswerTool
 from core.tools.generate_plan_tool import GeneratePlanTool
 from core.tools.reasoning_tool import ReasoningTool
 from core.tools.web_search_tool import WebSearchTool
+from core.tools.out_of_domain_tool import OutOfDomainTool
 
 # Tool lists for backward compatibility
 system_agent_tools = [
@@ -41,6 +42,7 @@ __all__ = [
     "CreateReportTool",
     "FinalAnswerTool",
     "ReasoningTool",
+    "OutOfDomainTool",
     # Tool lists
     "NextStepToolStub",
     "NextStepToolsBuilder",

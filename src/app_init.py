@@ -5,6 +5,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from db.middleware import db_session_middleware_function, request_id_middleware_function
 from endpoints.routers.agent_router import router as agent_router
+from endpoints.routers.chat_router import router as chat_router
 from endpoints.routers.system_router import system_routes
 from endpoints.routers.telegram_router import telegram_routes
 
@@ -23,6 +24,7 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=request_id_middleware_function)
 app.include_router(system_routes)
 app.include_router(telegram_routes)
 app.include_router(agent_router)
+app.include_router(chat_router)
 
 
 

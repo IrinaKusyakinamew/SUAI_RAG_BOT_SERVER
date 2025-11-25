@@ -1,11 +1,16 @@
 import asyncio
+import hashlib
+from datetime import datetime
 from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatAction
+from aiogram.filters import Command
 from aiogram.types import Message, Update
 
 from core.service import agent_service
+from dao.chat_history_dao import chat_history_dao
+from db.session import set_db_session_context
 from utils.config import CONFIG
 from utils.logger import get_logger
 
@@ -32,6 +37,51 @@ class TelegramService:
         self.bot = Bot(token=CONFIG.telegram.bot_token)
         self.dispatcher = Dispatcher()
 
+        @self.dispatcher.message(Command("clear"))
+        async def handle_clear_command(message: Message):
+            try:
+                user_id = str(message.from_user.id)
+                session_id = f"tg_user_{message.from_user.id}"
+
+                log.info(f"Clearing history for user {user_id}")
+
+                # Set up database session context
+                session_context_id = int(
+                    hashlib.sha256(f"clear_{user_id}_{datetime.now().isoformat()}".encode()).hexdigest()[:8],
+                    16,
+                )
+                set_db_session_context(session_id=session_context_id)
+
+                try:
+                    deleted_count = await chat_history_dao.delete_user_history(
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    await message.answer(
+                        f"✅ История диалога очищена ({deleted_count} сообщений удалено).\nНачнем с чистого листа!"
+                    )
+                    log.info(f"Cleared {deleted_count} messages for user {user_id}")
+                except Exception as e:
+                    log.error(f"Error clearing history: {e}", exc_info=True)
+                    await message.answer("❌ Ошибка при очистке истории диалога.")
+                finally:
+                    set_db_session_context(session_id=None)
+
+            except Exception as e:
+                log.error(f"Error handling /clear command: {e}", exc_info=True)
+                await message.answer("❌ Произошла ошибка при обработке команды.")
+
+        @self.dispatcher.message(Command("start"))
+        async def handle_start_command(message: Message):
+            """Handle /start command."""
+            await message.answer(
+                "👋 Привет! Я AI-ассистент.\n\n"
+                "Задавайте мне вопросы, и я постараюсь помочь!\n\n"
+                "Команды:\n"
+                "/clear - очистить историю диалога\n"
+                "/start - показать это сообщение"
+            )
+
         @self.dispatcher.message()
         async def handle_message(message: Message):
             log.info(f"Received message from {message.from_user.id}: {message.text}")
@@ -41,7 +91,15 @@ class TelegramService:
                     await self.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
                     user_id = str(message.from_user.id)
-                    response = await agent_service.process_message(user_id, message.text)
+                    # Use user_id as session_id to maintain context across all chats for this user
+                    session_id = f"tg_user_{message.from_user.id}"
+
+                    response = await agent_service.process_message(
+                        user_id=user_id,
+                        message=message.text,
+                        session_id=session_id,
+                        save_history=True,
+                    )
 
                     await message.answer(response)
 

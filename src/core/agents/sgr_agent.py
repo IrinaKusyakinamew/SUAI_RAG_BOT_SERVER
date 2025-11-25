@@ -26,6 +26,7 @@ class SGRAgent(BaseAgent):
         agent_config: AgentConfig,
         toolkit: list[Type[BaseTool]],
         def_name: str | None = None,
+        conversation_history: list[dict] | None = None,
         **kwargs: dict,
     ):
         super().__init__(
@@ -34,6 +35,7 @@ class SGRAgent(BaseAgent):
             agent_config=agent_config,
             toolkit=toolkit,
             def_name=def_name,
+            conversation_history=conversation_history,
             **kwargs,
         )
 

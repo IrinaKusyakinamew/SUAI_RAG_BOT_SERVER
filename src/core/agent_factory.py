@@ -50,12 +50,13 @@ class AgentFactory:
         return AsyncOpenAI(**client_kwargs)
 
     @classmethod
-    async def create(cls, agent_def: AgentDefinition, task: str) -> Agent:
+    async def create(cls, agent_def: AgentDefinition, task: str, conversation_history: list[dict] | None = None) -> Agent:
         """Create an agent instance from a definition.
 
         Args:
             agent_def: Agent definition with configuration (classes already resolved)
             task: Task for the agent to execute
+            conversation_history: Optional conversation history from previous messages
 
         Returns:
             Created agent instance
@@ -102,11 +103,13 @@ class AgentFactory:
                 toolkit=tools,
                 openai_client=cls._create_client(agent_def.llm),
                 agent_config=agent_def,
+                conversation_history=conversation_history or [],
             )
             logger.info(
                 f"Created agent '{agent_def.name}' "
                 f"using base class '{BaseClass.__name__}' "
-                f"with {len(agent.toolkit)} tools"
+                f"with {len(agent.toolkit)} tools "
+                f"and {len(conversation_history or [])} history messages"
             )
             return agent
         except Exception as e:
