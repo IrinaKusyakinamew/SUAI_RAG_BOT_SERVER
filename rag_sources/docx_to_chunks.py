@@ -1,30 +1,52 @@
 import json
 import re
-from pathlib import Path
+import io
 import tiktoken
 from tqdm import tqdm
+from datetime import datetime
+import hashlib
+from minio_client import get_minio_client
 
-# Корень проекта
-BASE_DIR = Path(__file__).parent.parent
+# Настройки путей и параметров
+BUCKET_SOURCE = "web-crawler"
+BUCKET_TARGET = "rag-sources"
+INPUT_OBJECT = "parsed_docx.json"
+OUTPUT_OBJECT = "tmp_chunks/docx_chunks.json"
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 50
 
-# Папка для временных файлов-чанков
-TMP_DIR = BASE_DIR / "rag_sources" / "tmp_chunks"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
+# Проверка существования бакета
+def ensure_bucket(bucket_name: str):
+    client = get_minio_client()
+    buckets = [b.name for b in client.list_buckets()]
+    if bucket_name not in buckets:
+        client.make_bucket(bucket_name)
 
-# Исходный json с docx доками
-INPUT_JSON = BASE_DIR / "parser" / "out_spider" / "spiders" / "parsed_docx.json"
+# Загрузка json из минио
+def load_json_from_minio(bucket: str, object_name: str):
+    client = get_minio_client()
+    response = client.get_object(bucket, object_name)
+    data = response.read()
+    return json.loads(data.decode("utf-8"))
 
-# Куда сохраняем чанки
-OUTPUT_JSON = TMP_DIR / "chunks_docx.json"
+# Загрузка json в минио
+def upload_json_to_minio(bucket: str, object_name: str, obj):
+    ensure_bucket(bucket)
+    client = get_minio_client()
+    data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+    client.put_object(
+        bucket_name=bucket,
+        object_name=object_name,
+        data=io.BytesIO(data),
+        length=len(data),
+        content_type="application/json"
+    )
 
-# Создаем папку для результата, если ее еще нет
-OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-
-# Удаляет лишние пробелы и переводит текст в аккуратный формат
+# Удаление лишних пробелов и перевод текста в аккуратный формат
 def normalize_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-# Разбивает текст на чанки по количеству токенов
+# Чанкинг по токенам gpt
 def chunk_by_gpt_tokens(text, chunk_size=512, overlap=50):
     enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
     tokens = enc.encode(text)
@@ -37,6 +59,7 @@ def chunk_by_gpt_tokens(text, chunk_size=512, overlap=50):
         end_idx = min(start_idx + chunk_size, len(tokens))
         chunk_text = enc.decode(tokens[start_idx:end_idx])
 
+        # Мягкий перенос — не обрывать на середине слова
         last_space = chunk_text.rfind(" ")
         if last_space != -1 and end_idx != len(tokens):
             chunk_text_trimmed = chunk_text[:last_space]
@@ -45,6 +68,7 @@ def chunk_by_gpt_tokens(text, chunk_size=512, overlap=50):
         else:
             new_end_idx = end_idx
 
+        # Определяем смещение чанка внутри исходного текста
         start_offset = text.find(chunk_text)
         end_offset = start_offset + len(chunk_text)
 
@@ -57,42 +81,49 @@ def chunk_by_gpt_tokens(text, chunk_size=512, overlap=50):
             "end_offset": end_offset
         })
 
+        # Двигаемся вперёд с перекрытием
         start_idx = max(new_end_idx - overlap, new_end_idx)
         chunk_id += 1
 
     return chunks
 
-# Загружаем исходный json с доками
-with open(INPUT_JSON, "r", encoding="utf-8") as f:
-    documents_dict = json.load(f)
+# Основная функция обработки docx
+def process_docx_chunks():
+    documents_dict = load_json_from_minio(BUCKET_SOURCE, INPUT_OBJECT)
+    all_chunks = []
+    # Глобальный счетчик чанков по всем документам
+    global_chunk_id = 0
 
-all_chunks = []
-# Глобальный счетчик чанков по всем документам
-global_chunk_id = 0
+    # Для каждого документа
+    for doc_id, text in tqdm(documents_dict.items(), desc="Chunking documents"):
+        # Приводим текст к строковому формату
+        if isinstance(text, list):
+            text = " ".join(map(str, text))
+        elif not isinstance(text, str):
+            text = str(text)
 
-# Для каждого документа
-for doc_id, text in tqdm(documents_dict.items(), desc="Chunking documents"):
-    # Приводим текст к строковому формату
-    if isinstance(text, list):
-        text = " ".join(map(str, text))
-    elif not isinstance(text, str):
-        text = str(text)
+        # Нормализуем и разбиваем на чанки
+        text = normalize_text(text)
+        chunks = chunk_by_gpt_tokens(text, chunk_size=512, overlap=50)
 
-    # Нормализуем и разбиваем на чанки
-    text = normalize_text(text)
-    chunks = chunk_by_gpt_tokens(text, chunk_size=512, overlap=50)
+        # Добавляем метаданные и уникальные идентификаторы
+        for chunk in chunks:
+            # id исходного документа
+            chunk["document_id"] = doc_id
+            # Глобальный id, уникален для всего файла
+            chunk["chunk_id"] = global_chunk_id
+            # Строковый uid для удобства
+            chunk["chunk_uid"] = f"{global_chunk_id}_chunk"
+            chunk["metadata"] = {
+                "source_docx_id": doc_id,
+                "source_hash": hashlib.md5(doc_id.encode()).hexdigest(),
+                "created_at": datetime.utcnow().isoformat() + "Z"
+            }
+            all_chunks.append(chunk)
+            global_chunk_id += 1
 
-    # Добавляем метаданные и уникальные идентификаторы
-    for chunk in chunks:
-        # id исходного документа
-        chunk["document_id"] = doc_id
-        # Глобальный id, уникален для всего файла
-        chunk["chunk_id"] = global_chunk_id
-        # Строковый uid для удобства
-        chunk["chunk_uid"] = f"{global_chunk_id}_chunk"
-        global_chunk_id += 1
-        all_chunks.append(chunk)
+    print(f"[MinIO] Всего чанков: {len(all_chunks)}")
+    upload_json_to_minio(BUCKET_TARGET, OUTPUT_OBJECT, {"chunks": all_chunks})
 
-# Сохраняем все чанки в json
-with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-    json.dump({"chunks": all_chunks}, f, ensure_ascii=False, indent=2)
+if __name__ == "__main__":
+    process_docx_chunks()

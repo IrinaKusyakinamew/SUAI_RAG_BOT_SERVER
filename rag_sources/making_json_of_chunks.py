@@ -1,29 +1,27 @@
+import io
 import json
 import re
 import uuid
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
-import shutil
+from minio_client import get_minio_client
 import tiktoken
+from loguru import logger
 
-# Папка с временными чанками
-TMP_CHUNKS_DIR = Path(__file__).parent / "tmp_chunks"
+# Настройки
+BUCKET = "rag-sources"
+TMP_CHUNKS_PREFIX = "tmp_chunks"  # исходные PDF/HTML/DOCX
+TMP_JSON_PREFIX = "tmp_chunks_for_embeddings"  # куда сохраняем объединённый JSON
 
-# Папка для объединённых JSON перед эмбеддингом
-TMP_JSON_DIR = Path(__file__).parent / "tmp_json_for_embedding"
-TMP_JSON_DIR.mkdir(parents=True, exist_ok=True)
-
-# Итоговый объединённый JSON
-OUTPUT_JSON = TMP_JSON_DIR / "all_chunks.json"
-
-# Минимальное количество токенов для сохранения ненулевых чанков (для html/pdf/docx)
+ENC = tiktoken.encoding_for_model("gpt-3.5-turbo")
 MIN_TOKENS = 50
 
-# Инициализация кодировщика для GPT токенов
-ENC = tiktoken.encoding_for_model("gpt-3.5-turbo")
+CHUNK_FILES = {"pdf_chunks.json", "docx_chunks.json", "html_chunks.json"}
+SCHEDULES_FILE = "schedules_chunks.json"
 
+client = get_minio_client()
 
+# Функции нормализации
 def clean_text(text: str) -> str:
     text = text.replace("\xa0", " ").replace("\u200b", " ")
     text = re.sub(r"[\r\n\t]+", " ", text)
@@ -31,14 +29,10 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+([,.!?;:])", r"\1", text)
     return text.strip()
 
-
 def tokenize(text: str) -> int:
-    """Подсчёт GPT-токенов через tiktoken"""
     return len(ENC.encode(text))
 
-
 def looks_like_navigation(html_fragment: str) -> bool:
-    """Простейшая фильтрация HTML навигационных блоков"""
     soup = BeautifulSoup(html_fragment, "lxml")
     text = soup.get_text(separator=" ", strip=True)
     if len(text.split()) < 5:
@@ -51,9 +45,7 @@ def looks_like_navigation(html_fragment: str) -> bool:
         return True
     return False
 
-
 def normalize_chunk(chunk: dict, source_url: str, doc_type: str, chunk_id: int, offset: int):
-    """Создаёт нормализованный объект чанка с UUID и GPT-токенами"""
     text = clean_text(chunk.get("text", ""))
     if not text:
         return None, offset
@@ -63,8 +55,14 @@ def normalize_chunk(chunk: dict, source_url: str, doc_type: str, chunk_id: int, 
     end_offset = offset + len(text)
     offset = end_offset
 
-    chunk_uid = str(uuid.uuid4())
+    if doc_type != "txt" and token_count < MIN_TOKENS:
+        return None, offset
+    if doc_type == "html":
+        raw_html = chunk.get("raw_html", chunk.get("text", ""))
+        if looks_like_navigation(raw_html):
+            return None, offset
 
+    chunk_uid = str(uuid.uuid4())
     normalized = {
         "chunk_id": chunk_id,
         "chunk_uid": chunk_uid,
@@ -77,89 +75,72 @@ def normalize_chunk(chunk: dict, source_url: str, doc_type: str, chunk_id: int, 
         "type": doc_type,
         "metadata": {
             "source": doc_type,
-            "path": source_url,
-            "created_at": datetime.utcnow().isoformat() + "Z"
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
     }
     return normalized, offset
 
+def upload_json_to_minio(object_name: str, data: dict):
+    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    client.put_object(
+        bucket_name=BUCKET,
+        object_name=f"{TMP_JSON_PREFIX}/{object_name}",
+        data=io.BytesIO(json_bytes),
+        length=len(json_bytes),
+        content_type="application/json"
+    )
+    logger.info(f"[MinIO] JSON загружен: {BUCKET}/{TMP_JSON_PREFIX}/{object_name}")
 
-def main():
+# ---------------------- Объединение и нормализация ----------------------
+def merge_and_normalize_chunks():
     all_chunks = []
-    global_chunk_id = 0
-    stats = {"kept": 0, "removed_short": 0, "removed_structural": 0, "removed_empty": 0}
+    chunk_id_global = 0
 
-    # Собираем все JSON файлы из tmp_chunks
-    input_files = sorted(TMP_CHUNKS_DIR.glob("*.json"))
-    if not input_files:
-        print("Нет файлов в tmp_chunks")
-        return
+    objects = client.list_objects(BUCKET, prefix=f"{TMP_CHUNKS_PREFIX}/", recursive=True)
+    for obj in objects:
+        file_name = obj.object_name.split("/")[-1]
+        if file_name not in CHUNK_FILES:
+            continue
 
-    for file_path in input_files:
-        print(f"Обрабатываем {file_path.name}...")
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        chunks = data.get("chunks", data if isinstance(data, list) else [])
+        logger.info(f"Обрабатываем {file_name}...")
+        data_bytes = client.get_object(BUCKET, obj.object_name).read()
+        data_json = json.loads(data_bytes)
+        chunks = data_json.get("chunks", data_json if isinstance(data_json, list) else [])
         offset = 0
-        # Определяем тип документа
-        doc_type = (
-            "html" if "html" in file_path.name
-            else "pdf" if "pdf" in file_path.name
-            else "docx" if "docx" in file_path.name
-            else "txt"
-        )
+
+        doc_type = "pdf" if "pdf" in file_name else "docx" if "docx" in file_name else "html"
 
         for ch in chunks:
-            text = clean_text(ch.get("text", ""))
-            if not text:
-                stats["removed_empty"] += 1
-                continue
-
-            token_count = tokenize(text)
-
-            # Для html/pdf/docx применяем фильтры
-            if doc_type != "txt":
-                if token_count < MIN_TOKENS:
-                    stats["removed_short"] += 1
-                    continue
-
-                if doc_type == "html":
-                    raw_html = ch.get("raw_html", ch.get("text", ""))
-                    if looks_like_navigation(raw_html):
-                        stats["removed_structural"] += 1
-                        continue
-
-            # Для txt сохраняем всё без фильтрации
-            source_url = (
-                ch.get("source_url")
-                or ch.get("document_id")
-                or ch.get("filename")
-                or file_path.name
-            )
-
-            normalized, offset = normalize_chunk(ch, source_url, doc_type, global_chunk_id, offset)
+            source_url = ch.get("source_url") or ch.get("document_id") or file_name
+            normalized, offset = normalize_chunk(ch, source_url, doc_type, chunk_id_global, offset)
             if normalized:
                 all_chunks.append(normalized)
-                global_chunk_id += 1
-                stats["kept"] += 1
+                chunk_id_global += 1
 
-    # Сохраняем объединённый JSON
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump({"chunks": all_chunks}, f, ensure_ascii=False, indent=2)
+    upload_json_to_minio("all_chunks.json", {"chunks": all_chunks})
+    logger.success(f"Объединение PDF/HTML/DOCX завершено. Всего чанков: {len(all_chunks)}")
 
-    print("\nОбработка завершена.")
-    print(f"  Сохранено чанков:      {stats['kept']}")
-    print(f"  Удалено коротких:      {stats['removed_short']}")
-    print(f"  Удалено пустых:        {stats['removed_empty']}")
-    print(f"  Удалено навигационных: {stats['removed_structural']}")
-    print(f"  ➜ Итог сохранён в: {OUTPUT_JSON}")
+def normalize_schedules():
+    try:
+        data_bytes = client.get_object(BUCKET, f"{TMP_JSON_PREFIX}/{SCHEDULES_FILE}").read()
+        data_json = json.loads(data_bytes)
+        chunks = data_json.get("chunks", data_json if isinstance(data_json, list) else [])
+        normalized_chunks = []
+        offset = 0
+        for i, ch in enumerate(chunks):
+            source_url = ch.get("source_url") or ch.get("document_id") or SCHEDULES_FILE
+            normalized, offset = normalize_chunk(ch, source_url, "txt", i, offset)
+            if normalized:
+                normalized_chunks.append(normalized)
 
-    # Удаляем временную папку с отдельными JSON
-    if TMP_CHUNKS_DIR.exists():
-        shutil.rmtree(TMP_CHUNKS_DIR)
-        print(f"🗑 Папка {TMP_CHUNKS_DIR} удалена")
-
+        upload_json_to_minio(SCHEDULES_FILE, {"chunks": normalized_chunks})
+        logger.success(f"schedules_chunks.json нормализован. Всего чанков: {len(normalized_chunks)}")
+    except Exception as e:
+        logger.error(f"Не удалось нормализовать schedules_chunks.json: {e}")
 
 if __name__ == "__main__":
-    main()
+    logger.info("Объединение и нормализация PDF/HTML/DOCX чанков ===")
+    merge_and_normalize_chunks()
+
+    logger.info("Нормализация schedules_chunks.json ===")
+    normalize_schedules()

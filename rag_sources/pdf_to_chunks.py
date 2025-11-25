@@ -1,114 +1,48 @@
 import asyncio
 import aiohttp
-import aiofiles
 import pandas as pd
-import os
 import json
 import re
-from pathlib import Path
-from urllib.parse import quote
-from tqdm.asyncio import tqdm_asyncio
-from tqdm import tqdm
+import hashlib
+from io import BytesIO
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTFigure
-from pdf2image import convert_from_path
-from PIL import Image
+from pdf2image import convert_from_bytes
 import pytesseract
 import tiktoken
-import hashlib
-import multiprocessing
-from datetime import datetime
-import shutil
-from pathlib import Path
+from tqdm import tqdm
+from minio_client import get_minio_client
 
-# Текущая директория, где лежит скрипт (rag_sources)
-PROJECT_DIR = Path(__file__).resolve().parent
+# Бакет, где лежит файл links.csv со ссылками pdf
+BUCKET_WEB_CRAWLER = "web-crawler"
+# Бакет, куда сохраняются извлеченные по ссылкам pdf документы и чанки
+BUCKET_RAG_SOURCES = "rag-sources"
 
-# Путь до CSV со ссылками
-INPUT_CSV = PROJECT_DIR.parent / "parser" / "out_spider" / "spiders" / "links.csv"
-
-# Директория, куда сохраняются временные и итоговые данные
-BASE_DIR = PROJECT_DIR  # rag_sources
-
+# Папка для сохранения pdf доков
+PDF_PREFIX = "saved_pdf"
 # Папка для временных чанков
-TMP_DIR = PROJECT_DIR / "tmp_chunks"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
+CHUNKS_PREFIX = "tmp_chunks"
 
-# Временные папки и файлы
-DOWNLOAD_DIR = BASE_DIR / "saved_pdf"
-PDF_DIR = DOWNLOAD_DIR / "pdf"
-MAP_PATH = DOWNLOAD_DIR / "pdf_url_map.json"
+# Названия файлов
+LINKS_CSV = "links.csv"
+OUTPUT_JSON_NAME = "pdf_chunks.json"
 
-# Итоговый файл чанков для PDF, будет использоваться в making_json_of_chunks
-OUTPUT_JSON = TMP_DIR / "chunks_pdf.json"
-
-# Параметры чанкинга и загрузки
+# Параметры для чанкинга и скачивания файлов
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 MAX_CONCURRENT = 12
-MAX_RETRIES = 3
+MAX_RETRIES = 3 # Попытки скачивания pdf
+MAX_WORKERS = 4 # Процессы для распознавания pdf
 
+client = get_minio_client()
 
-# 1. Скачивание pdf
-# Асинхронно скачивает один pdf документ и сохраняет в папку PDF_DIR
-async def download_pdf(session, url, idx, download_map):
-    encoded_url = quote(url, safe=':/?=&')
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with session.get(encoded_url, timeout=30, ssl=False) as response:
-                if response.status == 200:
-                    if "pdf" not in response.headers.get("Content-Type", "").lower():
-                        return
-
-                    safe_name = f"pdf_{idx}_{abs(hash(url))}.pdf"
-                    file_path = PDF_DIR / safe_name
-
-                    # Сохраняем файл, если его еще нет
-                    if not file_path.exists():
-                        async with aiofiles.open(file_path, "wb") as f:
-                            await f.write(await response.read())
-
-                    download_map[url] = safe_name
-                    return
-                else:
-                    raise Exception(f"HTTP {response.status}")
-        except:
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(1)
-
-# Считывает csv со ссылками и скачивает все pdf файлы
-async def download_all_pdfs(input_csv, download_dir):
-    os.makedirs(PDF_DIR, exist_ok=True)
-    df = pd.read_csv(input_csv, header=None, usecols=[0], dtype=str, names=["url"])
-    urls = df["url"].dropna().astype(str).str.strip().tolist()
-    urls = [u for u in urls if u.startswith(("http://", "https://"))]
-    urls = list(dict.fromkeys(urls))
-    print(f"Всего ссылок для скачивания: {len(urls)}")
-
-    download_map = {}
-
-    # Создаем сессию с ограничением числа одновременных подключений
-    connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [download_pdf(session, url, idx + 1, download_map) for idx, url in enumerate(urls)]
-        # Отображаем процесс загрузки
-        for f in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Скачивание PDF"):
-            await f
-
-    with open(MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(download_map, f, ensure_ascii=False, indent=2)
-
-    print(f"\nСкачивание завершено. Загружено {len(download_map)} файлов.")
-    return download_map
-
-
-# 2. Извлечение текста и чанкинг
-# Удаляет лишние пробелы и переводит строки в единый формат
+# Функция очистки текста
 def normalize_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-# Разбивает текст на перекрывающиеся чанки по токенам
+# Функция разбиения текста на чанки
 def chunk_by_gpt_tokens(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
     tokens = enc.encode(text)
@@ -116,17 +50,16 @@ def chunk_by_gpt_tokens(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
     while start_idx < len(tokens):
         end_idx = min(start_idx + chunk_size, len(tokens))
+        # Извлекаем токены чанка
         chunk_text = enc.decode(tokens[start_idx:end_idx])
-
-        # Стараемся не обрывать слова посередине
+        # Мягкий перенос, чтобы чанк заканчивался на пробеле
         last_space = chunk_text.rfind(" ")
         if last_space != -1 and end_idx != len(tokens):
             chunk_text = chunk_text[:last_space]
             end_idx = start_idx + len(enc.encode(chunk_text))
-
+        # Вычисляем точное положение чанка в исходном тексте
         start_offset = text.find(chunk_text)
         end_offset = start_offset + len(chunk_text)
-
         chunks.append({
             "chunk_uid": f"chunk_{chunk_id}",
             "chunk_id": chunk_id,
@@ -137,16 +70,12 @@ def chunk_by_gpt_tokens(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         })
         start_idx = max(end_idx - overlap, end_idx)
         chunk_id += 1
-
-    # Фильтруем короткие чанки
     return [c for c in chunks if c["token_count"] >= 40]
 
-# Определяем, не битый ли текст
+# Функция проверки, является ли текст pdf дока мусорным
 def looks_like_garbage(text: str) -> bool:
     if not text:
         return True
-
-    # 1. Проверка доли непечатаемых символов
     allowed_chars = (
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
         "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
@@ -156,28 +85,16 @@ def looks_like_garbage(text: str) -> bool:
     garbage_ratio = sum(ch not in allowed_chars for ch in text) / max(len(text), 1)
     if garbage_ratio > 0.3:
         return True
-
-    # 2. Проверка на повторяющиеся (cid:XXX)-паттерны
     cid_pattern = re.compile(r"\(cid:\d+\)")
-    cid_matches = cid_pattern.findall(text)
-    if cid_matches:
-        cid_ratio = sum(len(m) for m in cid_matches) / max(len(text), 1)
-        if cid_ratio > 0.1:  # если >10% текста — подозрительно
-            return True
-
-    # 3. Проверка на длинные последовательности странных символов
-    strange_seq_pattern = re.compile(r"[^A-Za-zА-Яа-я0-9 .,;:\-–—()\"'«»?!%\n\t]{5,}")
-    if strange_seq_pattern.search(text):
+    if cid_pattern.findall(text):
         return True
-
     return False
 
-
-# Извлекает текст из pdf, если не получилось, использует OCR
-def extract_text_from_pdf(pdf_path):
+# Функция извлечения текста через pdfminer
+def extract_text_from_pdf_bytes(pdf_bytes):
     try:
         text_parts = []
-
+        # Рекурсивное извлечение текста из pdf
         def recursive_elements(elements):
             for el in elements:
                 if isinstance(el, LTTextContainer):
@@ -185,7 +102,8 @@ def extract_text_from_pdf(pdf_path):
                 elif isinstance(el, LTFigure):
                     yield from recursive_elements(el._objs)
 
-        for page_layout in extract_pages(pdf_path):
+        # Обходим все страницы pdf
+        for page_layout in extract_pages(BytesIO(pdf_bytes)):
             page_text = []
             for element in recursive_elements(page_layout):
                 if isinstance(element, LTTextContainer):
@@ -195,77 +113,129 @@ def extract_text_from_pdf(pdf_path):
 
         text = normalize_text("\n\n".join(text_parts))
 
-        # Проверяем, не "битый" ли текст
+        # Если текст содержит мусор, используем OCR
         if not text or looks_like_garbage(text):
-            print(f"[OCR] {pdf_path.name}: текст повреждён, включаем распознавание...")
-            images = convert_from_path(pdf_path)
+            images = convert_from_bytes(pdf_bytes)
             ocr_texts = [pytesseract.image_to_string(img, config="--psm 6").strip() for img in images]
             text = normalize_text("\n\n".join(ocr_texts))
 
         return text
     except Exception as e:
-        print(f"[Ошибка при извлечении {pdf_path.name}]: {e}")
+        print(f"[Ошибка PDF]: {e}")
         return ""
 
-# Обрабатывает скачанные pdf, извлекает из них текст и делит на чанки
+# Функция предварительной очистки папки с pdf доками перед новой записью
+def clear_pdf_prefix(bucket: str, prefix: str):
+    objects = client.list_objects(bucket, prefix=prefix, recursive=True)
+    removed = 0
+    for obj in objects:
+        client.remove_object(bucket, obj.object_name)
+        removed += 1
+    print(f"[MinIO] Удалено {removed} PDF объектов из {prefix}/")
+
+# Параллельное скачивание pdf для 12 одновременных соединений до 3 попыток
+async def download_pdf(session, url, download_map, pbar):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.get(url, timeout=60, ssl=False) as response:
+                if response.status == 200 and url.lower().endswith(".pdf"):
+                    pdf_bytes = await response.read()
+                    file_name = f"{PDF_PREFIX}/pdf_{abs(hash(url))}.pdf"
+                    client.put_object(
+                        BUCKET_RAG_SOURCES,
+                        file_name,
+                        BytesIO(pdf_bytes),
+                        length=len(pdf_bytes)
+                    )
+                    download_map[url] = file_name
+                    pbar.update(1)
+                    return
+        except:
+            await asyncio.sleep(2)
+    print(f"[Ошибка скачивания]: {url}")
+    pbar.update(1)
+
+# Загрузка ссылок и скачивание всех pdf
+async def download_all_pdfs():
+    csv_obj = client.get_object(BUCKET_WEB_CRAWLER, LINKS_CSV)
+    df = pd.read_csv(BytesIO(csv_obj.read()), header=None, usecols=[0], dtype=str, names=["url"])
+    urls = df["url"].dropna().astype(str).str.strip().tolist()
+    urls = [u for u in urls if u.lower().endswith(".pdf")]
+    urls = list(dict.fromkeys(urls))
+    print(f"Всего PDF ссылок: {len(urls)}")
+
+    download_map = {}
+    connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        with tqdm(total=len(urls), desc="Скачивание PDF") as pbar:
+            tasks = [download_pdf(session, url, download_map, pbar) for url in urls]
+            await asyncio.gather(*tasks)
+
+    return download_map
+
+# Параллельная обработка pdf: извлечение текста, чанкинг, метаданные
 def process_pdfs(download_map):
-    all_pdfs = list(PDF_DIR.glob("*.pdf"))
     all_chunks = []
     global_chunk_id = 0
 
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(extract_text_from_pdf, pdf): pdf for pdf in all_pdfs}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Извлечение текста и чанкинг"):
-            pdf_file = futures[future]
-            text = future.result()
-            if not text:
-                continue
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                extract_text_from_pdf_bytes,
+                client.get_object(BUCKET_RAG_SOURCES, pdf_path).read()
+            ): (url, pdf_path)
+            for url, pdf_path in download_map.items()
+        }
 
-            # Разбиваем текст на чанки
-            chunks = chunk_by_gpt_tokens(text)
-            doc_id = hashlib.sha1(str(pdf_file).encode()).hexdigest()[:10]
-            source_url = next((u for u, f in download_map.items() if f == pdf_file.name), None)
+        with tqdm(total=len(futures), desc="Извлечение текста + чанки") as pbar:
+            for future in as_completed(futures):
+                url, pdf_path = futures[future]
+                text = future.result()
+                if not text:
+                    pbar.update(1)
+                    continue
 
-            # Добавляем метаданные
-            for chunk in chunks:
-                chunk.update({
-                    "document_id": doc_id,
-                    "filename": source_url or "unknown",
-                    "source_url": source_url or "unknown",
-                    "chunk_id": global_chunk_id,
-                    "chunk_uid": f"chunk_{global_chunk_id}",
-                    "metadata": {
-                        "source_url": source_url or "unknown",
-                        "local_filename": pdf_file.name,
-                        "source_hash": hashlib.md5((source_url or pdf_file.name).encode()).hexdigest(),
-                        "created_at": datetime.utcnow().isoformat() + "Z"
-                    }
-                })
-                all_chunks.append(chunk)
-                global_chunk_id += 1
+                chunks = chunk_by_gpt_tokens(text)
+                doc_id = hashlib.sha1(pdf_path.encode()).hexdigest()[:10]
 
-    # Сохраняем чанки в json
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump({"chunks": all_chunks}, f, ensure_ascii=False, indent=2)
+                for chunk in chunks:
+                    chunk.update({
+                        "document_id": doc_id,
+                        "source_url": url,
+                        "local_pdf": pdf_path,
+                        "chunk_id": global_chunk_id,
+                        "chunk_uid": f"chunk_{global_chunk_id}",
+                        "metadata": {
+                            "source_url": url,
+                            "pdf_file": pdf_path,
+                            "hash": hashlib.md5(url.encode()).hexdigest(),
+                            "created_at": datetime.utcnow().isoformat() + "Z"
+                        }
+                    })
+                    all_chunks.append(chunk)
+                    global_chunk_id += 1
 
-    print(f"\nИзвлечение завершено. Всего чанков: {len(all_chunks)}")
+                pbar.update(1)
 
+    json_bytes = json.dumps({"chunks": all_chunks}, ensure_ascii=False, indent=2).encode("utf-8")
+    client.put_object(
+        BUCKET_RAG_SOURCES,
+        f"{CHUNKS_PREFIX}/{OUTPUT_JSON_NAME}",
+        BytesIO(json_bytes),
+        length=len(json_bytes)
+    )
+    print(f"[MinIO] Сохранено чанков: {len(all_chunks)}")
 
-# 3. Полный цикл обновления
-# Загрузка, обработка pdf файлов и очистка временных директорий
+# Главная функция
 async def full_update():
-    print("Этап 1: Скачивание PDF")
-    download_map = await download_all_pdfs(INPUT_CSV, DOWNLOAD_DIR)
+    print("[MinIO] Очистка PDF папки...")
+    clear_pdf_prefix(BUCKET_RAG_SOURCES, PDF_PREFIX)
 
-    print("\nЭтап 2: Извлечение текста и разбиение на чанки")
+    print("Скачивание PDF...")
+    download_map = await download_all_pdfs()
+
+    print("Обработка PDF и создание чанков...")
     process_pdfs(download_map)
 
-    print("\nЭтап 3: Очистка временных директорий")
-    if DOWNLOAD_DIR.exists():
-        shutil.rmtree(DOWNLOAD_DIR)
-        print(f"Папка {DOWNLOAD_DIR} удалена.")
-
-
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     asyncio.run(full_update())
