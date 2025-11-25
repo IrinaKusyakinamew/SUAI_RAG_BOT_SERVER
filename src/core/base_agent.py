@@ -1,29 +1,35 @@
 import json
+import logging
 import os
 import traceback
 import uuid
 from datetime import datetime
 from typing import Type
 
-import httpx
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionFunctionToolParam
 
+from core.agent_definition import AgentConfig
 from core.models import AgentStatesEnum, ResearchContext
-from core.prompts import PromptLoader
+from core.services.prompt_loader import PromptLoader
+from core.services.registry import AgentRegistry
 from core.stream import OpenAIStreamingGenerator
 from core.tools import (
-    # Base
     BaseTool,
     ClarificationTool,
     ReasoningTool,
-    system_agent_tools,
 )
-from utils.config import CONFIG
 from utils.logger import get_logger
 
 
-class BaseAgent:
+class AgentRegistryMixin:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if cls.__name__ not in ("BaseAgent",):
+            AgentRegistry.register(cls, name=cls.name)
+
+
+class BaseAgent(AgentRegistryMixin):
     """Base class for agents."""
 
     name: str = "base_agent"
@@ -31,32 +37,31 @@ class BaseAgent:
     def __init__(
         self,
         task: str,
-        toolkit: list[Type[BaseTool]] | None = None,
-        max_iterations: int = 20,
-        max_clarifications: int = 3,
+        openai_client: AsyncOpenAI,
+        agent_config: AgentConfig,
+        toolkit: list[Type[BaseTool]],
+        def_name: str | None = None,
+        **kwargs: dict,
     ):
-        self.id = f"{self.name}_{uuid.uuid4()}"
-        self.logger = get_logger(f"core.agents.{self.name}")
+        self.id = f"{def_name or self.name}_{uuid.uuid4()}"
+        self.openai_client = openai_client
+        self.config = agent_config
         self.creation_time = datetime.now()
         self.task = task
-        self.toolkit = [*system_agent_tools, *(toolkit or [])]
+        self.toolkit = toolkit
 
         self._context = ResearchContext()
         self.conversation = []
-        self.log = []
-        self.max_iterations = max_iterations
-        self.max_clarifications = max_clarifications
 
-        client_kwargs = {"base_url": CONFIG.openai.base_url, "api_key": CONFIG.openai.api_key}
-        if CONFIG.openai.proxy.strip():
-            client_kwargs["http_client"] = httpx.AsyncClient(proxy=CONFIG.openai.proxy)
-
-        self.openai_client = AsyncOpenAI(**client_kwargs)
         self.streaming_generator = OpenAIStreamingGenerator(model=self.id)
+        self.logger = get_logger(f"Agent:{self.id}")
+        self.log = []
 
     async def provide_clarification(self, clarifications: str):
-        """Receive clarification from external source (e.g. user input)"""
-        self.conversation.append({"role": "user", "content": PromptLoader.get_clarification_template(clarifications)})
+        """Receive clarification from an external source (e.g. user input)"""
+        self.conversation.append(
+            {"role": "user", "content": PromptLoader.get_clarification_template(clarifications, self.config.prompts)}
+        )
         self._context.clarifications_used += 1
         self._context.clarification_received.set()
         self._context.state = AgentStatesEnum.RESEARCHING
@@ -110,12 +115,16 @@ class BaseAgent:
         )
 
     def _save_agent_log(self):
-        logs_dir = CONFIG.execution.logs_dir
+        from core.agent_config import GlobalConfig
+
+        logs_dir = GlobalConfig().execution.logs_dir
         os.makedirs(logs_dir, exist_ok=True)
         filepath = os.path.join(logs_dir, f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{self.id}-log.json")
         agent_log = {
             "id": self.id,
-            "model_config": CONFIG.openai.model_dump(exclude={"api_key", "proxy"}),
+            "model_config": self.config.llm.model_dump(
+                exclude={"api_key", "proxy"}
+            ),  # Sensitive data excluded by default
             "task": self.task,
             "toolkit": [tool.tool_name for tool in self.toolkit],
             "log": self.log,
@@ -126,12 +135,16 @@ class BaseAgent:
     async def _prepare_context(self) -> list[dict]:
         """Prepare conversation context with system prompt."""
         return [
-            {"role": "system", "content": PromptLoader.get_system_prompt(self.toolkit)},
+            {"role": "system", "content": PromptLoader.get_system_prompt(self.toolkit, self.config.prompts)},
+            {
+                "role": "user",
+                "content": PromptLoader.get_initial_user_request(self.task, self.config.prompts),
+            },
             *self.conversation,
         ]
 
     async def _prepare_tools(self) -> list[ChatCompletionFunctionToolParam]:
-        """Prepare available tools for current agent state and progress."""
+        """Prepare available tools for the current agent state and progress."""
         raise NotImplementedError("_prepare_tools must be implemented by subclass")
 
     async def _reasoning_phase(self) -> ReasoningTool:
@@ -139,16 +152,17 @@ class BaseAgent:
         raise NotImplementedError("_reasoning_phase must be implemented by subclass")
 
     async def _select_action_phase(self, reasoning: ReasoningTool) -> BaseTool:
-        """Select most suitable tool for the action decided in reasoning phase.
+        """Select the most suitable tool for the action decided in the
+        reasoning phase.
 
         Returns the tool suitable for the action.
         """
         raise NotImplementedError("_select_action_phase must be implemented by subclass")
 
     async def _action_phase(self, tool: BaseTool) -> str:
-        """Call Tool for the action decided in select_action phase.
+        """Call Tool for the action decided in the select_action phase.
 
-        Returns string or dumped json result of the tool execution.
+        Returns string or dumped JSON result of the tool execution.
         """
         raise NotImplementedError("_action_phase must be implemented by subclass")
 
@@ -156,14 +170,6 @@ class BaseAgent:
         self,
     ):
         self.logger.info(f"🚀 Starting for task: '{self.task}'")
-        self.conversation.extend(
-            [
-                {
-                    "role": "user",
-                    "content": PromptLoader.get_initial_user_request(self.task),
-                }
-            ]
-        )
         try:
             while self._context.state not in AgentStatesEnum.FINISH_STATES.value:
                 self._context.iteration += 1
@@ -177,6 +183,7 @@ class BaseAgent:
                 if isinstance(action_tool, ClarificationTool):
                     self.logger.info("\n⏸️  Research paused - please answer questions")
                     self._context.state = AgentStatesEnum.WAITING_FOR_CLARIFICATION
+                    self.streaming_generator.finish()
                     self._context.clarification_received.clear()
                     await self._context.clarification_received.wait()
                     continue
@@ -187,5 +194,5 @@ class BaseAgent:
             traceback.print_exc()
         finally:
             if self.streaming_generator is not None:
-                self.streaming_generator.finish()
+                self.streaming_generator.finish(self._context.execution_result)
             self._save_agent_log()

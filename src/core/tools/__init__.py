@@ -5,12 +5,12 @@ from core.next_step_tool import (
 )
 from core.tools.adapt_plan_tool import AdaptPlanTool
 from core.tools.clarification_tool import ClarificationTool
+from core.tools.create_report_tool import CreateReportTool
+from core.tools.extract_page_content_tool import ExtractPageContentTool
 from core.tools.final_answer_tool import FinalAnswerTool
-from core.tools.general_info_tool import GeneralInfoTool
 from core.tools.generate_plan_tool import GeneratePlanTool
-from core.tools.map_tool import MapTool
 from core.tools.reasoning_tool import ReasoningTool
-from core.tools.schedule_tool import ScheduleTool
+from core.tools.web_search_tool import WebSearchTool
 
 # Tool lists for backward compatibility
 system_agent_tools = [
@@ -21,13 +21,11 @@ system_agent_tools = [
     ReasoningTool,
 ]
 
-# University-specific tools
-university_tools = [
-    ScheduleTool,
-    MapTool,
-    GeneralInfoTool,
+research_agent_tools = [
+    WebSearchTool,
+    ExtractPageContentTool,
+    CreateReportTool,
 ]
-
 
 __all__ = [
     # Base classes
@@ -37,16 +35,16 @@ __all__ = [
     # Individual tools
     "ClarificationTool",
     "GeneratePlanTool",
+    "WebSearchTool",
+    "ExtractPageContentTool",
     "AdaptPlanTool",
+    "CreateReportTool",
     "FinalAnswerTool",
     "ReasoningTool",
-    "ScheduleTool",
-    "MapTool",
-    "GeneralInfoTool",
     # Tool lists
     "NextStepToolStub",
     "NextStepToolsBuilder",
     # Tool Collections
     "system_agent_tools",
-    "university_tools",
+    "research_agent_tools",
 ]

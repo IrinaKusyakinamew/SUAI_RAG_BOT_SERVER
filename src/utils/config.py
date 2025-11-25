@@ -111,16 +111,24 @@ class ConfigPrompts:
 class ConfigExecution:
     logs_dir: str
     reports_dir: str
+    max_clarifications: int
+    max_iterations: int
+    mcp_context_limit: int
 
 
 @dataclass
 class ConfigSearch:
     max_results: int
+    tavily_api_key: str
+    tavily_api_base_url: str
+    max_searches: int
+    content_limit: int
 
 
 @dataclass
 class ConfigMCP:
     context_limit: int
+    mcpServers: dict
 
 
 @dataclass
@@ -145,6 +153,7 @@ class Config:
     search: ConfigSearch
     mcp: ConfigMCP
     scraping: ConfigScraping
+    agents: dict
 
 
 class ConfigLoader:

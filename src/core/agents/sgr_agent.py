@@ -1,70 +1,74 @@
 from typing import Type
 
-from core.agents.base_agent import BaseAgent
+from openai import AsyncOpenAI
+
+from core.agent_definition import AgentConfig
+from core.base_agent import BaseAgent
 from core.tools import (
     BaseTool,
     ClarificationTool,
+    CreateReportTool,
     FinalAnswerTool,
     NextStepToolsBuilder,
     NextStepToolStub,
-    ReasoningTool,
-    system_agent_tools,
+    WebSearchTool,
 )
-from utils.config import CONFIG
 
 
-class SGRResearchAgent(BaseAgent):
+class SGRAgent(BaseAgent):
+
     name: str = "sgr_agent"
 
     def __init__(
         self,
         task: str,
-        toolkit: list[Type[BaseTool]] | None = None,
-        max_clarifications: int = 3,
-        max_iterations: int = 10,
-        max_searches: int = 4,
+        openai_client: AsyncOpenAI,
+        agent_config: AgentConfig,
+        toolkit: list[Type[BaseTool]],
+        def_name: str | None = None,
+        **kwargs: dict,
     ):
         super().__init__(
             task=task,
+            openai_client=openai_client,
+            agent_config=agent_config,
             toolkit=toolkit,
-            max_clarifications=max_clarifications,
-            max_iterations=max_iterations,
+            def_name=def_name,
+            **kwargs,
         )
 
-        self.toolkit = [
-            *system_agent_tools,
-            *(toolkit or []),
-        ]
-        self.toolkit.remove(ReasoningTool)  # we use our own reasoning scheme
-        self.max_searches = max_searches
-
     async def _prepare_tools(self) -> Type[NextStepToolStub]:
-        """Prepare tool classes with current context limits."""
         tools = set(self.toolkit)
-        if self._context.iteration >= self.max_iterations:
+        if self._context.iteration >= self.config.execution.max_iterations:
             tools = {
+                CreateReportTool,
                 FinalAnswerTool,
             }
-        if self._context.clarifications_used >= self.max_clarifications:
+        if self._context.clarifications_used >= self.config.execution.max_clarifications:
             tools -= {
                 ClarificationTool,
+            }
+        if self._context.searches_used >= self.config.search.max_searches:
+            tools -= {
+                WebSearchTool,
             }
         return NextStepToolsBuilder.build_NextStepTools(list(tools))
 
     async def _reasoning_phase(self) -> NextStepToolStub:
         async with self.openai_client.chat.completions.stream(
-            model=CONFIG.openai.model,
+            model=self.config.llm.model,
             response_format=await self._prepare_tools(),
             messages=await self._prepare_context(),
-            max_tokens=CONFIG.openai.max_tokens,
-            temperature=CONFIG.openai.temperature,
+            max_tokens=self.config.llm.max_tokens,
+            temperature=self.config.llm.temperature,
         ) as stream:
             async for event in stream:
                 if event.type == "chunk":
-                    self.streaming_generator.add_chunk(event)
+                    self.streaming_generator.add_chunk(event.chunk)
         reasoning: NextStepToolStub = (await stream.get_final_completion()).choices[0].message.parsed  # type: ignore
-        # we are not fully sure if it should be in conversation or not. Looks like not necessary data
-        # self.conversation.append({"role": "assistant", "content": reasoning.model_dump_json(exclude={"function"})})
+        self.streaming_generator.add_tool_call(
+            f"{self._context.iteration}-reasoning", reasoning.tool_name, reasoning.model_dump_json(exclude={"function"})
+        )
         self._log_reasoning(reasoning)
         return reasoning
 
@@ -88,27 +92,16 @@ class SGRResearchAgent(BaseAgent):
                 ],
             }
         )
-        self.streaming_generator.add_tool_call(f"{self._context.iteration}-action", tool.tool_name, tool.model_dump_json())
+        self.streaming_generator.add_tool_call(
+            f"{self._context.iteration}-action", tool.tool_name, tool.model_dump_json()
+        )
         return tool
 
     async def _action_phase(self, tool: BaseTool) -> str:
-        result = await tool(self._context)
-        self.conversation.append({"role": "tool", "content": result, "tool_call_id": f"{self._context.iteration}-action"})
+        result = await tool(self._context, self.config)
+        self.conversation.append(
+            {"role": "tool", "content": result, "tool_call_id": f"{self._context.iteration}-action"}
+        )
         self.streaming_generator.add_chunk_from_str(f"{result}\n")
         self._log_tool_execution(tool, result)
         return result
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    async def main():
-        agent = SGRResearchAgent(
-            task="найди информацию о репозитории на гитхаб sgr-deep-research и ответь на вопрос, " "какая основная концепция этого репозитория?",
-            max_iterations=5,
-            max_clarifications=2,
-            max_searches=3,
-        )
-        await agent.execute()
-
-    asyncio.run(main())

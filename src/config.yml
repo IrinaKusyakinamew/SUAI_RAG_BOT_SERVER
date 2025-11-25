@@ -45,15 +45,25 @@ prompts:
 execution:
   logs_dir: "./logs"
   reports_dir: "./reports"
+  max_clarifications: 3
+  max_iterations: 10
+  mcp_context_limit: 15000
 
 search:
   max_results: 5
+  tavily_api_key: ""
+  tavily_api_base_url: "https://api.tavily.com"
+  max_searches: 4
+  content_limit: 1500
 
 mcp:
   context_limit: 10000
+  mcpServers: {}
 
 scraping:
   content_limit: 5000
+
+agents: {}
 
 logging:
   app_name: rag_server

@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 
 class SourceData(BaseModel):
+    """Data about a research source."""
+
     number: int = Field(description="Citation number")
     title: str | None = Field(default="Untitled", description="Page title")
     url: str = Field(description="Source URL")
@@ -19,6 +21,8 @@ class SourceData(BaseModel):
 
 
 class SearchResult(BaseModel):
+    """Search result with query, answer, and sources."""
+
     query: str = Field(description="Search query")
     answer: str | None = Field(default=None, description="AI-generated answer from search")
     citations: list[SourceData] = Field(default_factory=list, description="List of source citations")
@@ -54,7 +58,9 @@ class ResearchContext(BaseModel):
     searches_used: int = Field(default=0, description="Number of searches performed")
 
     clarifications_used: int = Field(default=0, description="Number of clarifications requested")
-    clarification_received: asyncio.Event = Field(default_factory=asyncio.Event, description="Event for clarification synchronization")
+    clarification_received: asyncio.Event = Field(
+        default_factory=asyncio.Event, description="Event for clarification synchronization"
+    )
 
     def agent_state(self) -> dict:
         return self.model_dump(exclude={"searches", "sources", "clarification_received"})
