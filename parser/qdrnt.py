@@ -9,13 +9,16 @@ import io
 minio_client = get_minio_client()
 
 # путь к объекту в Minio (попытка хотя бы с 1 файлом из 2)
-jsonl_object_path = 'embeddings/all_chunks.jsonl'  
-bucket_name = 'rag-sources' 
+jsonl_object_path = 'embeddings/all_chunks.jsonl'
+bucket_name = 'rag-sources'
 
 # клиент Qdrant
 client = QdrantClient(
     url='http://212.192.220.24:6333',
-    api_key='pii5z%cE1'
+    api_key='pii5z%cE1',
+    # ИЗМЕНЕНО
+    timeout=120, # Таймаут для предотвращения разрыва соединения
+    prefer_grpc=False # Используем REST вместо gRPC для стабильности
 )
 
 collection_name = 'text_embeddings'
@@ -45,27 +48,21 @@ try:
     # парсим каждую строку
     for line in text_data.splitlines():
         obj = json.loads(line)
-        id_ = obj['id']
-        text = obj['text']
-        embedding = obj['embedding']
-        metadata = obj.get('metadata', {})
-
-        payload = {
-            'text': text,
-            **metadata
-        }
-
+        # ИЗМЕНЕНО: добавление метаданных
         point = {
-            "id": id_,
-            "vector": embedding,
-            "payload": payload
+            "id": obj["id"],
+            "vector": obj["embedding"],
+            "payload": {
+                "text": obj["text"],
+                **obj.get("metadata", {})
+            }
         }
         points.append(point)
 finally:
     response.close()
 
 # деление на батчи и загрузка
-batch_size = 1000
+batch_size = 100 # ИЗМЕНЕНО: уменьшили размер батча для предотвращения таймаута
 total_points = len(points)
 
 for i in range(0, total_points, batch_size):
