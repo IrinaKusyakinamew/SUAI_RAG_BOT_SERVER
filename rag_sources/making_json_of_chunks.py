@@ -29,6 +29,14 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+([,.!?;:])", r"\1", text)
     return text.strip()
 
+# Функция, находящая все уникальные группы и возвращающая список строк
+def extract_group(text: str):
+    pattern = r"\b[а-яА-Яa-zA-Z]*\d{3,4}[а-яА-Яa-zA-Z]*\b"
+    matches = re.findall(pattern, text)
+    cleaned = [m.strip(",. ") for m in matches]
+    return list(set([m.lower() for m in cleaned]))
+
+
 def tokenize(text: str) -> int:
     return len(ENC.encode(text))
 
@@ -91,7 +99,7 @@ def upload_json_to_minio(object_name: str, data: dict):
     )
     logger.info(f"[MinIO] JSON загружен: {BUCKET}/{TMP_JSON_PREFIX}/{object_name}")
 
-# ---------------------- Объединение и нормализация ----------------------
+# Объединение и нормализация
 def merge_and_normalize_chunks():
     all_chunks = []
     chunk_id_global = 0
@@ -129,8 +137,20 @@ def normalize_schedules():
         offset = 0
         for i, ch in enumerate(chunks):
             source_url = ch.get("source_url") or ch.get("document_id") or SCHEDULES_FILE
-            normalized, offset = normalize_chunk(ch, source_url, "txt", i, offset)
+            text = ch.get("text", "")
+            group = extract_group(text)
+            normalized, offset = normalize_chunk(
+                ch,
+                source_url,
+                "txt",
+                i,
+                offset
+            )
+
             if normalized:
+                if group:
+                    normalized["metadata"]["group"] = group  # добавляем группу для расписания
+
                 normalized_chunks.append(normalized)
 
         upload_json_to_minio(SCHEDULES_FILE, {"chunks": normalized_chunks})
