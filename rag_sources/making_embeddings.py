@@ -84,13 +84,13 @@ def generate_embeddings(chunks, key_name):
 def main():
     logger.info(f"Используется модель эмбеддингов: {MODEL_NAME} ({DEVICE})")
 
-    # all_chunks
-    all_chunks = load_chunks_from_minio(ALL_CHUNKS_KEY)
-    generate_embeddings(all_chunks, ALL_CHUNKS_EMB_KEY)
-
     # schedules_chunks
     schedules_chunks = load_chunks_from_minio(SCHEDULES_KEY)
     generate_embeddings(schedules_chunks, SCHEDULES_EMB_KEY)
+
+    # all_chunks
+    all_chunks = load_chunks_from_minio(ALL_CHUNKS_KEY)
+    generate_embeddings(all_chunks, ALL_CHUNKS_EMB_KEY)
 
 
 if __name__ == "__main__":
