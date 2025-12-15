@@ -31,60 +31,51 @@ client = QdrantClient(
 
 # ЗАПИХАЛИ В ФУНКЦИЮ
 def to_qdrnt(bucket_name, jsonl_object_path, collection_name):
-    # проверка и создание коллекции
     collections = [col.name for col in client.get_collections().collections]
     if collection_name not in collections:
         print(f"Создаю коллекцию '{collection_name}'...")
-        vector_size = 384
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
         )
         print(f"Коллекция '{collection_name}' успешно создана.")
     else:
         print(f"Коллекция '{collection_name}' уже существует.")
 
-    # получение файла из Minio
     response = minio_client.get_object(bucket_name, jsonl_object_path)
 
     points = []
 
     try:
-        # читаем весь контент как байты
-        data = response.read()
-        text_data = data.decode('utf-8')
-        # парсим каждую строку
-        for line in text_data.splitlines():
+        data = response.read().decode("utf-8")
+        for line in data.splitlines():
             obj = json.loads(line)
-            # ИЗМЕНЕНО: добавление метаданных
+
+            # ВАЖНО: мы НЕ пересобираем структуру
             point = {
                 "id": obj["id"],
-                "vector": obj["embedding"],
-                "payload": {
-                    "text": obj["text"],
-                    **obj.get("metadata", {})
-                }
+                "vector": obj["vector"],
+                "payload": obj["payload"]
             }
+
             points.append(point)
+
     finally:
         response.close()
 
-    # деление на батчи и загрузка
-    batch_size = 100 # ИЗМЕНЕНО: уменьшили размер батча для предотвращения таймаута
+    batch_size = 100
     total_points = len(points)
 
     for i in range(0, total_points, batch_size):
-        batch_points = points[i:i + batch_size]
-        try:
-            client.upsert(
-                collection_name=collection_name,
-                points=batch_points
-            )
-            print(f"Загружено {i + len(batch_points)} / {total_points} точек")
-        except Exception as e:
-            print(f"Ошибка при загрузке батча с {i} по {i + len(batch_points)}: {e}")
+        batch = points[i:i + batch_size]
+        client.upsert(
+            collection_name=collection_name,
+            points=batch
+        )
+        print(f"Загружено {i + len(batch)} / {total_points}")
 
     print("Загрузка завершена.")
+
 
 # вызываем функцию для каждого файла
 to_qdrnt(bucket_name, jsonl_object_path1, collection_name1)
