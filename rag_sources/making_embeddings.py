@@ -1,96 +1,121 @@
 import io
 import json
-import torch
+from typing import List, Dict
+
 from tqdm import tqdm
 from loguru import logger
-from langchain_huggingface import HuggingFaceEmbeddings
-from minio_client import get_minio_client
-import warnings
+from sentence_transformers import SentenceTransformer
 
-warnings.filterwarnings("ignore")
+from minio_client import get_minio_client
+
 
 # Настройки
 BUCKET_SOURCE = "rag-sources"
-ALL_CHUNKS_KEY = "tmp_chunks_for_embeddings/all_chunks.json"
-SCHEDULES_KEY = "tmp_chunks_for_embeddings/schedules_chunks.json"
-ALL_CHUNKS_EMB_KEY = "embeddings/all_chunks.jsonl"
-SCHEDULES_EMB_KEY = "embeddings/schedules_chunks.jsonl"
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BUCKET_TARGET = "rag-sources"
+
+# Объекты с чанками
+SCHEDULES_CHUNKS_OBJECT = "tmp_chunks_for_embeddings/schedules_chunks.json"
+ALL_CHUNKS_OBJECT = "tmp_chunks_for_embeddings/all_chunks.json"
+
+# Куда сохраняем эмбеддинги
+SCHEDULES_EMBEDDINGS_OBJECT = "embeddings/schedules_chunks.jsonl"
+ALL_EMBEDDINGS_OBJECT = "embeddings/all_chunks.jsonl"
+
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" # Поменять
+DEVICE = "cpu"
 BATCH_SIZE = 32
 
-client = get_minio_client()
 
-# Вспомогательные функции
-def load_chunks_from_minio(key: str):
-    try:
-        obj = client.get_object(BUCKET_SOURCE, key)
-        data = json.loads(obj.read())
-        chunks = data.get("chunks", data if isinstance(data, list) else [])
-        logger.info(f"Загружено {len(chunks)} чанков из {key}")
-        return chunks
-    except Exception as e:
-        logger.error(f"Не удалось загрузить {key}: {e}")
-        return []
+# Загрузка чанков из минио
+def load_chunks(object_name: str) -> List[Dict]:
+    client = get_minio_client()
+    data = client.get_object(BUCKET_SOURCE, object_name).read()
+    parsed = json.loads(data.decode("utf-8"))
+    chunks = parsed.get("chunks", [])
+    logger.info(f"Загружено {len(chunks)} чанков из {object_name}")
+    return chunks
 
-def upload_jsonl_to_minio(bucket: str, object_name: str, records):
-    """Сохраняет JSONL прямо в MinIO"""
-    jsonl_bytes = "\n".join(json.dumps(r, ensure_ascii=False) for r in records).encode("utf-8")
+
+# Формирование текста для эмбеддинга
+def build_text(chunk: Dict) -> str:
+    # Если это расписание, расширяем метаданные
+    if chunk.get("type") == "schedule":
+        m = chunk.get("metadata", {})
+        parts = [
+            m.get("day"),
+            m.get("time"),
+            f"Неделя: {m.get('week')}",
+            m.get("lesson_type"),
+            m.get("subject"),
+            f"Аудитория: {m.get('room')}",
+            f"Преподаватели: {', '.join(m.get('teacher', []))}",
+            f"Группы: {', '.join(m.get('groups', []))}",
+            f"Кафедра {m.get('department')}",
+        ]
+        return ". ".join(p for p in parts if p)
+    # Если другой документ
+    else:
+        return chunk.get("text") or ""
+
+
+# Генерация эмбеддингов для списка чанков и сохранение в минио
+def generate_embeddings(chunks: List[Dict], output_object: str):
+    client = get_minio_client()
+    model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+
+    buffer = io.StringIO()
+
+    # Обрабатываем чанки батчами
+    for i in tqdm(range(0, len(chunks), BATCH_SIZE), desc=output_object):
+        batch = chunks[i:i + BATCH_SIZE]
+        # Тексы для эмбеддинга
+        texts = [build_text(c) for c in batch]
+        # Генерим эмбеддинги
+        vectors = model.encode(texts, show_progress_bar=False)
+
+        # Формируем структуру для jsonl
+        for chunk, vector, text in zip(batch, vectors, texts):
+            record = {
+                "id": chunk["chunk_uid"], # ВАЖНО, чтобы прошла загрузка в qdrant
+                "vector": vector.tolist(),
+                "payload": {
+                    "text": text,
+                    "type": chunk.get("type"),
+                    "document_id": chunk.get("document_id"),
+                    "source_url": chunk.get("source_url"),
+                    "metadata": chunk.get("metadata", {})
+                }
+            }
+            buffer.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # Конвертируем буфер в байты для загрузки в минио
+    data = buffer.getvalue().encode("utf-8")
+
+    # Сохраняем результат в минио
     client.put_object(
-        bucket_name=bucket,
-        object_name=object_name,
-        data=io.BytesIO(jsonl_bytes),
-        length=len(jsonl_bytes),
+        bucket_name=BUCKET_TARGET,
+        object_name=output_object,
+        data=io.BytesIO(data),
+        length=len(data),
         content_type="application/json"
     )
-    logger.success(f"JSONL загружен в {bucket}/{object_name}")
 
-# Генерация эмбеддингов
-def generate_embeddings(chunks, key_name):
-    if not chunks:
-        logger.warning(f"Нет чанков для {key_name}, пропуск...")
-        return
+    logger.success(f"Эмбеддинги сохранены: {output_object}")
 
-    embeddings_model = HuggingFaceEmbeddings(
-        model_name=MODEL_NAME,
-        model_kwargs={"device": DEVICE},
-        encode_kwargs={"normalize_embeddings": True},
+
+# Главная функция, загружает все чанки и генерит для них эмбеддинги
+def main():
+    # Эмбеддинги чанков расписания
+    generate_embeddings(
+        load_chunks(SCHEDULES_CHUNKS_OBJECT),
+        SCHEDULES_EMBEDDINGS_OBJECT
     )
 
-    records = []
-    for i in tqdm(range(0, len(chunks), BATCH_SIZE), desc=f"Генерация эмбеддингов {key_name}", ncols=100):
-        batch = chunks[i:i + BATCH_SIZE]
-        texts = [c["text"] for c in batch]
-        uids = [c.get("chunk_uid", str(idx)) for idx, c in enumerate(batch)]
-        metadatas = [c.get("metadata", {}) for c in batch]
-
-        try:
-            batch_embeddings = embeddings_model.embed_documents(texts)
-        except Exception as e:
-            logger.warning(f"Ошибка в батче {i}: {e}")
-            continue
-
-        for uid, text, emb, metadata in zip(uids, texts, batch_embeddings, metadatas):
-            records.append({
-                "id": uid,
-                "text": text,
-                "embedding": emb,
-                "metadata": metadata,
-            })
-
-    upload_jsonl_to_minio(BUCKET_SOURCE, key_name, records)
-    logger.info(f"Эмбеддинги {key_name} созданы для {len(records)} чанков")
-
-def main():
-    logger.info(f"Используется модель эмбеддингов: {MODEL_NAME} ({DEVICE})")
-
-    # schedules_chunks
-    schedules_chunks = load_chunks_from_minio(SCHEDULES_KEY)
-    generate_embeddings(schedules_chunks, SCHEDULES_EMB_KEY)
-
-    # all_chunks
-    all_chunks = load_chunks_from_minio(ALL_CHUNKS_KEY)
-    generate_embeddings(all_chunks, ALL_CHUNKS_EMB_KEY)
+    # Эмбеддинги остальных чанков
+    generate_embeddings(
+        load_chunks(ALL_CHUNKS_OBJECT),
+        ALL_EMBEDDINGS_OBJECT
+    )
 
 
 if __name__ == "__main__":
